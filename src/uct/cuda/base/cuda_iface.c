@@ -23,17 +23,67 @@ uct_cuda_base_query_devices_common(
         uct_md_h md, uct_device_type_t dev_type,
         uct_tl_device_resource_t **tl_devices_p, unsigned *num_tl_devices_p)
 {
-    ucs_sys_device_t sys_device = UCS_SYS_DEVICE_ID_UNKNOWN;
+    uct_tl_device_resource_t *devices = NULL;
+    unsigned num_devices              = 0;
+    ucs_sys_device_t sys_device       = UCS_SYS_DEVICE_ID_UNKNOWN;
     CUdevice cuda_device;
     ucs_status_t status;
+    int num_gpus, i;
 
-    if (uct_cuda_ctx_is_active()) {
-        status = UCT_CUDADRV_FUNC_LOG_ERR(cuCtxGetDevice(&cuda_device));
+    /* Enumerate every visible CUDA device and register one transport-layer
+     * device per GPU, each carrying its own sys_device. This lets the
+     * topology-aware iface scoring (ucp_worker_iface_set_sys_device_distance
+     * with select_distance_md=cuda_cpy) compute meaningful per-GPU distances
+     * for IB ifaces, instead of collapsing every CUDA-memory comparison to a
+     * single proxy answer that is often UNKNOWN at iface-init time. */
+    status = UCT_CUDADRV_FUNC(cuDeviceGetCount(&num_gpus), UCS_LOG_LEVEL_DIAG);
+    if ((status != UCS_OK) || (num_gpus <= 0)) {
+        goto fallback_single;
+    }
+
+    devices = ucs_calloc(num_gpus, sizeof(*devices), "cuda_tl_devices");
+    if (devices == NULL) {
+        return UCS_ERR_NO_MEMORY;
+    }
+
+    for (i = 0; i < num_gpus; ++i) {
+        status = UCT_CUDADRV_FUNC(cuDeviceGet(&cuda_device, i),
+                                  UCS_LOG_LEVEL_DIAG);
         if (status != UCS_OK) {
-            return status;
+            continue;
         }
 
         sys_device = uct_cuda_get_sys_dev(cuda_device);
+        if (sys_device == UCS_SYS_DEVICE_ID_UNKNOWN) {
+            continue;
+        }
+
+        ucs_snprintf_zero(devices[num_devices].name,
+                          sizeof(devices[num_devices].name),
+                          UCT_CUDA_DEV_NAME ":%d", (int)cuda_device);
+        devices[num_devices].type       = dev_type;
+        devices[num_devices].sys_device = sys_device;
+        ++num_devices;
+    }
+
+    if (num_devices == 0) {
+        ucs_free(devices);
+        goto fallback_single;
+    }
+
+    *tl_devices_p     = devices;
+    *num_tl_devices_p = num_devices;
+    return UCS_OK;
+
+fallback_single:
+    /* No usable per-GPU enumeration. Preserve legacy single-device behavior:
+     * report the current context's GPU when one is active, else UNKNOWN. */
+    sys_device = UCS_SYS_DEVICE_ID_UNKNOWN;
+    if (uct_cuda_ctx_is_active()) {
+        status = UCT_CUDADRV_FUNC_LOG_ERR(cuCtxGetDevice(&cuda_device));
+        if (status == UCS_OK) {
+            sys_device = uct_cuda_get_sys_dev(cuda_device);
+        }
     } else {
         ucs_debug("set cuda sys_device to `unknown` as no context is"
                   " currently active");

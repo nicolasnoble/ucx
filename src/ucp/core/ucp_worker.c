@@ -1283,17 +1283,26 @@ ucp_worker_iface_get_sys_device(const ucp_worker_iface_t *wiface)
 
 static void ucp_worker_iface_set_sys_device_distance(ucp_worker_iface_t *wiface)
 {
-    const ucp_context_h context      = wiface->worker->context;
-    ucs_sys_dev_distance_t *distance = &wiface->distance;
-    ucs_sys_device_t device          = UCS_SYS_DEVICE_ID_UNKNOWN;
-    ucs_sys_device_t cmp_device      = UCS_SYS_DEVICE_ID_UNKNOWN;
+    const ucp_context_h context          = wiface->worker->context;
+    ucs_sys_dev_distance_t *distance     = &wiface->distance;
+    ucs_sys_device_t device              = UCS_SYS_DEVICE_ID_UNKNOWN;
+    ucs_sys_device_t cmp_device          = UCS_SYS_DEVICE_ID_UNKNOWN;
+    ucs_sys_device_t best_cmp_device     = UCS_SYS_DEVICE_ID_UNKNOWN;
+    ucp_tl_resource_desc_t *best_cmp_rsc = NULL;
+    ucs_sys_dev_distance_t candidate;
     ucp_rsc_index_t i;
     ucp_tl_resource_desc_t *cmp_rsc;
     char buf[128];
     ucs_status_t status;
 
     *distance = ucs_topo_default_distance;
+    device    = ucp_worker_iface_get_sys_device(wiface);
 
+    /* Iterate every transport resource that belongs to the configured
+     * select_distance_md (typically cuda_cpy) and pick the one whose system
+     * device is topologically closest to this iface. With one resource per
+     * GPU, this means each iface gets its true distance to the nearest GPU
+     * instead of collapsing to a single proxy answer. */
     for (i = 0; i < context->num_tls; i++) {
         cmp_rsc = &context->tl_rscs[i];
         if (strcmp(context->tl_mds[cmp_rsc->md_index].rsc.md_name,
@@ -1301,19 +1310,36 @@ static void ucp_worker_iface_set_sys_device_distance(ucp_worker_iface_t *wiface)
             continue;
         }
 
-        device     = ucp_worker_iface_get_sys_device(wiface);
         cmp_device = cmp_rsc->tl_rsc.sys_device;
 
-        status = ucs_topo_get_distance(device, cmp_device, distance);
-        ucs_assertv_always(status == UCS_OK, "device=%u cmp_device=%u", device,
-                           cmp_device);
+        /* Skip resources without topology info: ucs_topo_get_distance would
+         * short-circuit them to default-distance, masking better candidates. */
+        if (cmp_device == UCS_SYS_DEVICE_ID_UNKNOWN) {
+            continue;
+        }
 
-        ucs_trace("distance between %s/%s and %s/%s is %s",
+        status = ucs_topo_get_distance(device, cmp_device, &candidate);
+        if (status != UCS_OK) {
+            continue;
+        }
+
+        if ((best_cmp_rsc == NULL) ||
+            (candidate.bandwidth > distance->bandwidth)) {
+            *distance       = candidate;
+            best_cmp_device = cmp_device;
+            best_cmp_rsc    = cmp_rsc;
+        }
+    }
+
+    if (best_cmp_rsc != NULL) {
+        ucs_trace("distance between %s/%s and %s/%s is %s "
+                  "(closest %s candidate)",
                   context->tl_rscs[wiface->rsc_index].tl_rsc.tl_name,
-                  ucs_topo_sys_device_get_name(device), cmp_rsc->tl_rsc.tl_name,
-                  ucs_topo_sys_device_get_name(cmp_device),
-                  ucs_topo_distance_str(distance, buf, sizeof(buf)));
-        return;
+                  ucs_topo_sys_device_get_name(device),
+                  best_cmp_rsc->tl_rsc.tl_name,
+                  ucs_topo_sys_device_get_name(best_cmp_device),
+                  ucs_topo_distance_str(distance, buf, sizeof(buf)),
+                  context->config.ext.select_distance_md);
     }
 }
 
